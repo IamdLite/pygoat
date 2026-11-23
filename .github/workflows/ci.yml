@@ -1,0 +1,127 @@
+name: CI
+
+# triggers pipeline when push is made to any branch (typical CI pipeline rule)
+on: [push]
+
+jobs:
+  sast_scan:
+    name: Run Bandit Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Run Bandit Scan
+        # save report in json format
+        run: bandit -ll -ii -r . -f json -o bandit-report.json
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        # execute this step no matter of previous status
+        with:
+          # how artifacts will be named when exported
+          name: bandit-findings
+          path: bandit-report.json
+
+  image_scan:
+    # each new job runs in a new isolated environment
+    name: Build and Run Image Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker Image
+        run: docker build -f Dockerfile -t mytestapp:latest .
+
+      - name: Docker Scout Scan
+        uses: docker/scout-action@v1.15.1
+        with:
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          command: quickview,cves
+          only-severities: critical,high
+          sarif-file: scout-report.sarif
+          # exit code by default is true which means 0, add true to produce non success
+          exit-code: true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docker-scout-findings
+          path: scout-report.sarif
+
+  # ----------------------------------------------------------------------------
+  # Task 3 — Dynamic Application Security Testing (DAST) with OWASP ZAP
+  # ----------------------------------------------------------------------------
+  dast_scan:
+    name: Run DAST Scan (OWASP ZAP)
+    runs-on: ubuntu-latest
+    # Depend on the earlier jobs so DAST runs last, but use `if: always()` so a
+    # FAILED upstream job (expected — Bandit/Scout find vulnerabilities) does not
+    # skip the dynamic scan. Without `if: always()`, a failed dependency would
+    # cancel this job and we would get no DAST evidence.
+    needs: [sast_scan, image_scan]
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy PyGoat (official image)
+        run: |
+          docker pull pygoat/pygoat:latest
+          docker run --rm -d --name pygoat -p 8000:8000 pygoat/pygoat:latest
+
+      - name: Wait for PyGoat to be ready
+        # health check: poll the app until it answers (max ~60s) before scanning
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/login/ || true)
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+              echo "PyGoat is up"; exit 0
+            fi
+            sleep 3
+          done
+          echo "PyGoat did not become ready in time"; docker logs pygoat || true; exit 1
+
+      - name: Run OWASP ZAP baseline scan
+        # --network host lets the ZAP container reach the app on localhost:8000.
+        # '|| true' keeps the pipeline going so the report is always uploaded;
+        # ZAP returns non-zero when it finds issues (expected for PyGoat).
+        run: |
+          mkdir -p zap-out && chmod 0777 zap-out
+          docker run --network host -v "$(pwd)/zap-out:/zap/wrk/:rw" \
+            -t ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:8000 \
+            -r zap-report.html -J zap-report.json -w zap-report.md -I || true
+
+      - name: Summarize ZAP findings
+        if: always()
+        run: |
+          echo "### OWASP ZAP DAST summary" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f zap-out/zap-report.md ]; then
+            cat zap-out/zap-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No ZAP markdown report produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-dast-findings
+          path: zap-out/
